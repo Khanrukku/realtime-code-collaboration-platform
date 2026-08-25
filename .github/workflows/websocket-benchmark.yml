@@ -1,0 +1,58 @@
+name: WebSocket Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start collaboration server
+        run: |
+          uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > server.log 2>&1 &
+
+      - name: Wait for API
+        run: |
+          for i in {1..30}; do
+            if curl --fail \
+              http://127.0.0.1:8000/api/v1/health; then
+
+              echo "Server ready"
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          cat server.log
+          exit 1
+
+      - name: Run WebSocket benchmark
+        run: |
+          python benchmarks/websocket_benchmark.py
+
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          cat server.log || true
