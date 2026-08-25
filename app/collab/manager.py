@@ -1,396 +1,166 @@
-from fastapi.testclient import TestClient
+import asyncio
 
-from app.main import app
+from fastapi import WebSocket
+
+from app.collab.document import Room
+from app.collab.models import Operation, RoomSnapshot
+from app.core.config import settings
 
 
-def _receive_until(websocket, expected_types, max_messages=5):
+class CollaborationManager:
     """
-    Receive messages until all expected message types are seen.
+    Manages collaborative editing rooms and connected WebSocket clients.
+
+    Responsibilities:
+      - create and retrieve collaboration rooms
+      - maintain room membership
+      - provide current document snapshots
+      - apply versioned operations
+      - broadcast committed operations to connected clients
+      - clean up disconnected clients
     """
-    received = {}
 
-    for _ in range(max_messages):
-        message = websocket.receive_json()
-        received[message["type"]] = message
+    def __init__(self):
+        self._rooms: dict[str, Room] = {}
+        self._rooms_lock = asyncio.Lock()
 
-        if expected_types.issubset(received.keys()):
-            return received
+    async def get_or_create(
+        self,
+        room_id: str,
+    ) -> Room:
+        """
+        Return an existing room or create it atomically.
+        """
+        async with self._rooms_lock:
+            room = self._rooms.get(room_id)
 
-    raise AssertionError(
-        f"Expected message types {expected_types}, "
-        f"received {set(received.keys())}"
-    )
-
-
-def test_websocket_operation_roundtrip():
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/ws/ws-room/client-a"
-        ) as websocket:
-
-            snapshot = websocket.receive_json()
-
-            assert snapshot["type"] == "snapshot"
-            assert snapshot["data"]["version"] == 0
-
-            websocket.send_json(
-                {
-                    "type": "insert",
-                    "position": 0,
-                    "text": "hello",
-                    "base_version": 0,
-                    "operation_id": "op-1",
-                }
-            )
-
-            messages = _receive_until(
-                websocket,
-                {"operation", "ack"},
-            )
-
-            assert (
-                messages["operation"]["data"]["text"]
-                == "hello"
-            )
-
-            assert (
-                messages["operation"]["data"]["version"]
-                == 1
-            )
-
-            assert (
-                messages["ack"]["operation_id"]
-                == "op-1"
-            )
-
-            assert (
-                messages["ack"]["version"]
-                == 1
-            )
-
-
-def test_two_clients_receive_same_operation():
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/ws/multi-client-room/client-a"
-        ) as client_a:
-
-            snapshot_a = client_a.receive_json()
-            assert snapshot_a["type"] == "snapshot"
-
-            with client.websocket_connect(
-                "/ws/multi-client-room/client-b"
-            ) as client_b:
-
-                snapshot_b = client_b.receive_json()
-                assert snapshot_b["type"] == "snapshot"
-
-                client_a.send_json(
-                    {
-                        "type": "insert",
-                        "position": 0,
-                        "text": "A",
-                        "base_version": 0,
-                        "operation_id": "op-a",
-                    }
+            if room is None:
+                room = Room(
+                    room_id,
+                    max_history=settings.max_history,
                 )
 
-                messages_a = _receive_until(
-                    client_a,
-                    {"operation", "ack"},
-                )
+                self._rooms[room_id] = room
 
-                operation_b = client_b.receive_json()
+            return room
 
-                assert (
-                    messages_a["operation"]["data"]["version"]
-                    == 1
-                )
-
-                assert operation_b["type"] == "operation"
-
-                assert (
-                    operation_b["data"]["text"]
-                    == "A"
-                )
-
-                assert (
-                    operation_b["data"]["version"]
-                    == 1
-                )
-
-
-def test_concurrent_insert_same_position_is_deterministic():
-    """
-    Two clients create inserts against version 0 at the same position.
-
-    client-a sorts before client-b, so the transformation rule should
-    produce deterministic text ordering.
-    """
-    room_id = "concurrent-insert-room"
-
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-a"
-        ) as client_a:
-
-            client_a.receive_json()
-
-            with client.websocket_connect(
-                f"/ws/{room_id}/client-b"
-            ) as client_b:
-
-                client_b.receive_json()
-
-                client_a.send_json(
-                    {
-                        "type": "insert",
-                        "position": 0,
-                        "text": "A",
-                        "base_version": 0,
-                        "operation_id": "insert-a",
-                    }
-                )
-
-                _receive_until(
-                    client_a,
-                    {"operation", "ack"},
-                )
-
-                client_b.receive_json()
-
-                client_b.send_json(
-                    {
-                        "type": "insert",
-                        "position": 0,
-                        "text": "B",
-                        "base_version": 0,
-                        "operation_id": "insert-b",
-                    }
-                )
-
-                _receive_until(
-                    client_b,
-                    {"operation", "ack"},
-                )
-
-                broadcast_to_a = client_a.receive_json()
-
-                assert broadcast_to_a["type"] == "operation"
-                assert broadcast_to_a["data"]["version"] == 2
-
-        snapshot = client.get(
-            f"/api/v1/rooms/{room_id}"
+    async def snapshot(
+        self,
+        room_id: str,
+    ) -> RoomSnapshot:
+        """
+        Return the latest document snapshot for a room.
+        """
+        room = await self.get_or_create(
+            room_id
         )
 
-        assert snapshot.status_code == 200
-
-        data = snapshot.json()
-
-        assert data["version"] == 2
-        assert data["text"] == "AB"
-
-
-def test_stale_insert_after_delete_is_transformed():
-    """
-    A client submits an operation created against an older version.
-
-    The server transforms the stale insert against the committed delete.
-    """
-    room_id = "insert-delete-room"
-
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-a"
-        ) as client_a:
-
-            client_a.receive_json()
-
-            client_a.send_json(
-                {
-                    "type": "insert",
-                    "position": 0,
-                    "text": "abcd",
-                    "base_version": 0,
-                    "operation_id": "seed",
-                }
+        async with room.lock:
+            return RoomSnapshot(
+                room_id=room_id,
+                text=room.document.text,
+                version=room.document.version,
+                clients=len(room.clients),
             )
 
-            _receive_until(
-                client_a,
-                {"operation", "ack"},
-            )
+    async def connect(
+        self,
+        room_id: str,
+        websocket: WebSocket,
+    ) -> Room:
+        """
+        Accept a WebSocket connection and synchronize the client
+        with the latest server-side document state.
 
-            with client.websocket_connect(
-                f"/ws/{room_id}/client-b"
-            ) as client_b:
-
-                snapshot_b = client_b.receive_json()
-
-                assert (
-                    snapshot_b["data"]["text"]
-                    == "abcd"
-                )
-
-                assert (
-                    snapshot_b["data"]["version"]
-                    == 1
-                )
-
-                client_a.send_json(
-                    {
-                        "type": "delete",
-                        "position": 1,
-                        "length": 2,
-                        "base_version": 1,
-                        "operation_id": "delete-a",
-                    }
-                )
-
-                _receive_until(
-                    client_a,
-                    {"operation", "ack"},
-                )
-
-                client_b.receive_json()
-
-                client_b.send_json(
-                    {
-                        "type": "insert",
-                        "position": 4,
-                        "text": "X",
-                        "base_version": 1,
-                        "operation_id": "insert-b",
-                    }
-                )
-
-                _receive_until(
-                    client_b,
-                    {"operation", "ack"},
-                )
-
-                client_a.receive_json()
-
-        snapshot = client.get(
-            f"/api/v1/rooms/{room_id}"
+        This snapshot also allows reconnecting clients to recover
+        changes that happened while they were disconnected.
+        """
+        room = await self.get_or_create(
+            room_id
         )
 
-        assert snapshot.status_code == 200
+        await websocket.accept()
 
-        data = snapshot.json()
+        async with room.lock:
+            room.clients.add(websocket)
 
-        assert data["version"] == 3
-        assert data["text"] == "adX"
-
-
-def test_future_version_operation_returns_error():
-    room_id = "invalid-version-room"
-
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-a"
-        ) as websocket:
-
-            websocket.receive_json()
-
-            websocket.send_json(
-                {
-                    "type": "insert",
-                    "position": 0,
-                    "text": "invalid",
-                    "base_version": 100,
-                    "operation_id": "invalid-op",
-                }
+            snapshot = RoomSnapshot(
+                room_id=room_id,
+                text=room.document.text,
+                version=room.document.version,
+                clients=len(room.clients),
             )
 
-            response = websocket.receive_json()
+        await websocket.send_json(
+            {
+                "type": "snapshot",
+                "data": snapshot.model_dump(),
+            }
+        )
 
-            assert response["type"] == "error"
+        return room
 
-            assert (
-                "base_version cannot be ahead"
-                in response["detail"]
+    async def disconnect(
+        self,
+        room: Room,
+        websocket: WebSocket,
+    ):
+        """
+        Remove a disconnected WebSocket client from the room.
+        """
+        async with room.lock:
+            room.clients.discard(
+                websocket
             )
 
+    async def apply_and_broadcast(
+        self,
+        room: Room,
+        operation: Operation,
+    ):
+        """
+        Apply a client operation to the shared document and broadcast
+        the committed operation to all currently connected clients.
 
-def test_reconnecting_client_receives_latest_snapshot():
-    """
-    A client disconnects while another client continues editing.
-
-    When the original client reconnects, it should receive the latest
-    document state and server version in the initial snapshot.
-    """
-    room_id = "reconnect-room"
-
-    with TestClient(app) as client:
-
-        # Client A joins and creates the initial document.
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-a"
-        ) as client_a:
-
-            initial_snapshot = client_a.receive_json()
-
-            assert initial_snapshot["type"] == "snapshot"
-            assert initial_snapshot["data"]["version"] == 0
-
-            client_a.send_json(
-                {
-                    "type": "insert",
-                    "position": 0,
-                    "text": "hello",
-                    "base_version": 0,
-                    "operation_id": "a-1",
-                }
+        Document mutation is protected by the room-level asyncio lock
+        so concurrent operations are serialized deterministically.
+        """
+        async with room.lock:
+            committed = room.document.apply(
+                operation
             )
 
-            _receive_until(
-                client_a,
-                {"operation", "ack"},
+            clients = list(
+                room.clients
             )
 
-        # Client A is now disconnected.
+        payload = {
+            "type": "operation",
+            "data": committed.model_dump(),
+        }
 
-        # Client B joins and continues editing.
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-b"
-        ) as client_b:
+        dead_clients = []
 
-            snapshot_b = client_b.receive_json()
+        for client in clients:
+            try:
+                await client.send_json(
+                    payload
+                )
 
-            assert snapshot_b["data"]["text"] == "hello"
-            assert snapshot_b["data"]["version"] == 1
+            except Exception:
+                dead_clients.append(
+                    client
+                )
 
-            client_b.send_json(
-                {
-                    "type": "insert",
-                    "position": 5,
-                    "text": " world",
-                    "base_version": 1,
-                    "operation_id": "b-1",
-                }
-            )
+        # Remove clients whose connection failed during broadcast.
+        if dead_clients:
+            async with room.lock:
+                for client in dead_clients:
+                    room.clients.discard(
+                        client
+                    )
 
-            _receive_until(
-                client_b,
-                {"operation", "ack"},
-            )
+        return committed
 
-        # Client A reconnects after missing B's operation.
-        with client.websocket_connect(
-            f"/ws/{room_id}/client-a"
-        ) as reconnected_a:
 
-            latest_snapshot = reconnected_a.receive_json()
-
-            assert latest_snapshot["type"] == "snapshot"
-
-            assert (
-                latest_snapshot["data"]["text"]
-                == "hello world"
-            )
-
-            assert (
-                latest_snapshot["data"]["version"]
-                == 2
-            )
+manager = CollaborationManager()
